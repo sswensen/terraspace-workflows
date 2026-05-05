@@ -1,0 +1,204 @@
+name: Terraspace Plan
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: "Runner label"
+        type: string
+        required: true
+      terraform_version:
+        description: "Terraform version to install"
+        type: string
+        default: "1.10.5"
+      ruby_version:
+        description: "Ruby version"
+        type: string
+        default: "3.1"
+      aws_region:
+        description: "AWS region"
+        type: string
+        default: us-east-1
+      ts_env:
+        description: "Terraspace environment"
+        type: string
+        default: prod
+      vault_secret_path:
+        description: "Vault KV path for AWS credentials"
+        type: string
+        default: dotfiles/aws
+    secrets:
+      VAULT_ADDR:
+        required: true
+      VAULT_GITHUB_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  detect-stacks:
+    runs-on: ${{ inputs.runner }}
+    outputs:
+      stacks: ${{ steps.find-stacks.outputs.stacks }}
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Detect changed stacks
+      id: find-stacks
+      run: |
+        changed_stacks=$(git diff --name-only origin/${{ github.base_ref }}...HEAD \
+          | grep '^app/stacks/' \
+          | cut -d'/' -f3 \
+          | sort -u \
+          | jq -R -s -c 'split("\n") | map(select(length > 0))')
+        echo "stacks=$changed_stacks" >> "$GITHUB_OUTPUT"
+        echo "Detected changed stacks: $changed_stacks"
+
+  plan:
+    needs: detect-stacks
+    if: needs.detect-stacks.outputs.stacks != '[]'
+    runs-on: ${{ inputs.runner }}
+    strategy:
+      matrix:
+        stack: ${{ fromJSON(needs.detect-stacks.outputs.stacks) }}
+      fail-fast: false
+
+    env:
+      AWS_REGION: ${{ inputs.aws_region }}
+      GH_TOKEN: ${{ github.token }}
+      TS_ENV: ${{ inputs.ts_env }}
+      TS_VERSION_CHECK: "0"
+
+    steps:
+    - name: Setup tool cache
+      run: |
+        sudo mkdir -p /opt/hostedtoolcache
+        sudo chown -R $(id -u):$(id -g) /opt/hostedtoolcache
+
+    - name: Cache apt packages
+      uses: actions/cache@v4
+      with:
+        path: /var/cache/apt/archives
+        key: apt-${{ runner.os }}-build-essential-gh
+
+    - name: Install build dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential libffi-dev unzip
+        # Install gh CLI
+        if ! command -v gh &> /dev/null; then
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y gh
+        fi
+
+    - name: Cache Terraform and Infracost
+      uses: actions/cache@v4
+      with:
+        path: |
+          /usr/local/bin/terraform
+          /usr/local/bin/infracost
+        key: tools-${{ runner.os }}-terraform-${{ inputs.terraform_version }}
+
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Import secrets from Vault
+      uses: hashicorp/vault-action@v3
+      with:
+        url: ${{ secrets.VAULT_ADDR }}
+        method: github
+        githubToken: ${{ secrets.VAULT_GITHUB_TOKEN }}
+        secrets: |
+          ${{ inputs.vault_secret_path }} access_key_id | AWS_ACCESS_KEY_ID ;
+          ${{ inputs.vault_secret_path }} secret_access_key | AWS_SECRET_ACCESS_KEY
+
+    - name: Install Ruby
+      uses: ruby/setup-ruby@v1
+      with:
+        ruby-version: ${{ inputs.ruby_version }}
+        bundler-cache: true
+
+    - name: Install Terraform
+      run: |
+        if [ -f /usr/local/bin/terraform ] && terraform version | grep -q "${{ inputs.terraform_version }}"; then
+          echo "Terraform ${{ inputs.terraform_version }} already installed (cached)"
+        else
+          curl -fsSL "https://releases.hashicorp.com/terraform/${{ inputs.terraform_version }}/terraform_${{ inputs.terraform_version }}_linux_amd64.zip" -o /tmp/terraform.zip
+          sudo unzip -o /tmp/terraform.zip -d /usr/local/bin/
+          rm /tmp/terraform.zip
+        fi
+        terraform --version
+
+    - name: Install Terraspace
+      run: |
+        bundle install
+        bundle exec terraspace version
+
+    - name: Run Terraspace Plan
+      id: plan
+      run: |
+        bundle exec terraspace plan ${{ matrix.stack }} 2>&1 | tee /tmp/plan_output.txt
+      continue-on-error: true
+
+    - name: Comment on PR
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        STACK="${{ matrix.stack }}"
+        MARKER="<!-- terraspace-plan:${STACK} -->"
+        STATUS="${{ steps.plan.outcome }}"
+
+        if [ "$STATUS" = "success" ]; then
+          ICON="✅"
+        else
+          ICON="❌"
+        fi
+
+        # Strip ANSI color codes and truncate if too long (GitHub limit is 65536 chars)
+        PLAN_OUTPUT=$(sed 's/\x1B\[[0-9;]*[a-zA-Z]//g' /tmp/plan_output.txt | head -c 60000)
+        if [ "$(wc -c < /tmp/plan_output.txt)" -gt 60000 ]; then
+          PLAN_OUTPUT="${PLAN_OUTPUT}
+
+        ... (output truncated)"
+        fi
+
+        # Write comment body to file to avoid quoting issues
+        {
+          echo "${MARKER}"
+          echo "## ${ICON} Terraspace Plan: \`${STACK}\`"
+          echo ""
+          echo "<details><summary>Show Plan Output</summary>"
+          echo ""
+          echo '```'
+          echo "${PLAN_OUTPUT}"
+          echo '```'
+          echo ""
+          echo "</details>"
+        } > /tmp/comment_body.md
+
+        # Find existing comment with this marker
+        COMMENT_ID=$(gh api \
+          "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments" \
+          --jq ".[] | select(.body | contains(\"${MARKER}\")) | .id" \
+          | head -1)
+
+        if [ -n "$COMMENT_ID" ]; then
+          gh api \
+            "repos/${{ github.repository }}/issues/comments/${COMMENT_ID}" \
+            -X PATCH \
+            -F body=@/tmp/comment_body.md
+        else
+          gh pr comment "${{ github.event.pull_request.number }}" \
+            --body-file /tmp/comment_body.md
+        fi
+
+    - name: Fail if plan failed
+      if: steps.plan.outcome == 'failure'
+      run: exit 1

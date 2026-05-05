@@ -1,0 +1,135 @@
+name: Terraspace Deploy
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: "Runner label"
+        type: string
+        required: true
+      terraform_version:
+        description: "Terraform version to install"
+        type: string
+        default: "1.10.5"
+      ruby_version:
+        description: "Ruby version"
+        type: string
+        default: "3.1"
+      aws_region:
+        description: "AWS region"
+        type: string
+        default: us-east-1
+      ts_env:
+        description: "Terraspace environment"
+        type: string
+        default: prod
+      vault_secret_path:
+        description: "Vault KV path for AWS credentials"
+        type: string
+        default: dotfiles/aws
+    secrets:
+      VAULT_ADDR:
+        required: true
+      VAULT_GITHUB_TOKEN:
+        required: true
+
+jobs:
+  detect-stacks:
+    runs-on: ${{ inputs.runner }}
+    outputs:
+      stacks: ${{ steps.find-stacks.outputs.stacks }}
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Detect changed stacks
+      id: find-stacks
+      run: |
+        changed_stacks=$(git diff --name-only ${{ github.event.before }} ${{ github.sha }} \
+          | grep '^app/stacks/' \
+          | cut -d'/' -f3 \
+          | sort -u \
+          | jq -R -s -c 'split("\n") | map(select(length > 0))')
+        echo "stacks=$changed_stacks" >> "$GITHUB_OUTPUT"
+        echo "Detected changed stacks: $changed_stacks"
+
+  deploy:
+    needs: detect-stacks
+    if: needs.detect-stacks.outputs.stacks != '[]'
+    runs-on: ${{ inputs.runner }}
+    strategy:
+      matrix:
+        stack: ${{ fromJSON(needs.detect-stacks.outputs.stacks) }}
+      fail-fast: false
+
+    env:
+      AWS_REGION: ${{ inputs.aws_region }}
+      GH_TOKEN: ${{ github.token }}
+      TS_ENV: ${{ inputs.ts_env }}
+      TS_VERSION_CHECK: "0"
+
+    steps:
+    - name: Setup tool cache
+      run: |
+        sudo mkdir -p /opt/hostedtoolcache
+        sudo chown -R $(id -u):$(id -g) /opt/hostedtoolcache
+
+    - name: Cache apt packages
+      uses: actions/cache@v4
+      with:
+        path: /var/cache/apt/archives
+        key: apt-${{ runner.os }}-build-essential
+
+    - name: Install build dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential libffi-dev unzip
+
+    - name: Cache Terraform and Infracost
+      uses: actions/cache@v4
+      with:
+        path: |
+          /usr/local/bin/terraform
+          /usr/local/bin/infracost
+        key: tools-${{ runner.os }}-terraform-${{ inputs.terraform_version }}
+
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Import secrets from Vault
+      uses: hashicorp/vault-action@v3
+      with:
+        url: ${{ secrets.VAULT_ADDR }}
+        method: github
+        githubToken: ${{ secrets.VAULT_GITHUB_TOKEN }}
+        secrets: |
+          ${{ inputs.vault_secret_path }} access_key_id | AWS_ACCESS_KEY_ID ;
+          ${{ inputs.vault_secret_path }} secret_access_key | AWS_SECRET_ACCESS_KEY
+
+    - name: Install Ruby
+      uses: ruby/setup-ruby@v1
+      with:
+        ruby-version: ${{ inputs.ruby_version }}
+        bundler-cache: true
+
+    - name: Install Terraform
+      run: |
+        if [ -f /usr/local/bin/terraform ] && terraform version | grep -q "${{ inputs.terraform_version }}"; then
+          echo "Terraform ${{ inputs.terraform_version }} already installed (cached)"
+        else
+          curl -fsSL "https://releases.hashicorp.com/terraform/${{ inputs.terraform_version }}/terraform_${{ inputs.terraform_version }}_linux_amd64.zip" -o /tmp/terraform.zip
+          sudo unzip -o /tmp/terraform.zip -d /usr/local/bin/
+          rm /tmp/terraform.zip
+        fi
+        terraform --version
+
+    - name: Install Terraspace
+      run: |
+        bundle install
+        bundle exec terraspace version
+
+    - name: Run Terraspace
+      run: |
+        bundle exec terraspace up ${{ matrix.stack }} -y
