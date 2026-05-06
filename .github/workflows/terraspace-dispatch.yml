@@ -31,6 +31,10 @@ on:
         description: "Vault KV path for AWS credentials"
         type: string
         default: dotfiles/aws
+      vault_kubeconfig_path:
+        description: "Vault KV path for kubeconfig (optional, enables k8s access)"
+        type: string
+        default: ""
     secrets:
       VAULT_ADDR:
         required: true
@@ -84,6 +88,28 @@ jobs:
         secrets: |
           ${{ inputs.vault_secret_path }} access_key_id | AWS_ACCESS_KEY_ID ;
           ${{ inputs.vault_secret_path }} secret_access_key | AWS_SECRET_ACCESS_KEY
+
+    - name: Import kubeconfig from Vault
+      if: inputs.vault_kubeconfig_path != ''
+      id: kubeconfig-vault
+      uses: hashicorp/vault-action@v3
+      with:
+        url: ${{ secrets.VAULT_ADDR }}
+        method: github
+        githubToken: ${{ secrets.VAULT_GITHUB_TOKEN }}
+        exportEnv: false
+        secrets: |
+          ${{ inputs.vault_kubeconfig_path }} config | KUBECONFIG_CONTENT
+
+    - name: Setup kubeconfig
+      if: inputs.vault_kubeconfig_path != ''
+      run: |
+        mkdir -p ~/.kube
+        echo "$KUBECONFIG_CONTENT" > ~/.kube/config
+        chmod 600 ~/.kube/config
+        echo "KUBECONFIG=$HOME/.kube/config" >> "$GITHUB_ENV"
+      env:
+        KUBECONFIG_CONTENT: ${{ steps.kubeconfig-vault.outputs.KUBECONFIG_CONTENT }}
 
     - name: Install Ruby
       uses: ruby/setup-ruby@v1
