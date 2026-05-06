@@ -93,7 +93,7 @@ jobs:
     - name: Install build dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y build-essential libffi-dev unzip
+        sudo apt-get install -y build-essential libffi-dev unzip file
         # Install gh CLI
         if ! command -v gh &> /dev/null; then
           curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg

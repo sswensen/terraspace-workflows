@@ -66,7 +66,7 @@ jobs:
     - name: Install build dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y build-essential libffi-dev unzip
+        sudo apt-get install -y build-essential libffi-dev unzip file
 
     - name: Cache Terraform and Infracost
       uses: actions/cache@v4
