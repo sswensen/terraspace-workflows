@@ -48,7 +48,7 @@ jobs:
       stacks: ${{ steps.find-stacks.outputs.stacks }}
     steps:
     - name: Checkout
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
       with:
         fetch-depth: 0
 
@@ -85,7 +85,7 @@ jobs:
         sudo chown -R $(id -u):$(id -g) /opt/hostedtoolcache
 
     - name: Cache apt packages
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         path: /var/cache/apt/archives
         key: apt-${{ runner.os }}-build-essential-gh
@@ -103,7 +103,7 @@ jobs:
         fi
 
     - name: Cache Terraform and Infracost
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         path: |
           /usr/local/bin/terraform
@@ -111,10 +111,10 @@ jobs:
         key: tools-${{ runner.os }}-terraform-${{ inputs.terraform_version }}
 
     - name: Checkout
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
 
     - name: Import secrets from Vault
-      uses: hashicorp/vault-action@v3
+      uses: hashicorp/vault-action@v4
       with:
         url: ${{ secrets.VAULT_ADDR }}
         method: github
@@ -126,7 +126,7 @@ jobs:
     - name: Import kubeconfig from Vault
       if: inputs.vault_kubeconfig_path != ''
       id: kubeconfig-vault
-      uses: hashicorp/vault-action@v3
+      uses: hashicorp/vault-action@v4
       with:
         url: ${{ secrets.VAULT_ADDR }}
         method: github
